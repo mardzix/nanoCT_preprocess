@@ -1,0 +1,144 @@
+include: 'Snakefile_functions.py'
+
+workflow_dir = os.path.dirname(workflow.basedir)
+
+rule all:
+    input:
+        expand('results/{sample}/{modality}/seurat/peaks/Seurat_object.Rds', sample = config['sample'], modality = config['modalities']),
+        expand('results/{sample}/{modality}/seurat/bin_{binsize}/Seurat_object.Rds', sample = config['sample'], modality = config['modalities'],binsize = [5000]),
+
+rule demultiplex:
+    input:
+        script = workflow_dir + '/scripts/debarcode.py',
+        fastq  = lambda wildcards: [x for x in config['fastq'] if wildcards.lane in x]
+    output:
+        'results/{sample}/{modality}/fastq_demultiplexed/{prefix}_{lane}_R1_{suffix}',
+        'results/{sample}/{modality}/fastq_demultiplexed/{prefix}_{lane}_R2_{suffix}',
+        'results/{sample}/{modality}/fastq_demultiplexed/{prefix}_{lane}_R3_{suffix}'
+    params:
+        out_folder = lambda wildcards: 'results/{sample}/fastq_demultiplexed/{modality}'.format(sample=wildcards.sample, modality=wildcards.modality),
+        barcode    = lambda wildcards: config['modalities'][wildcards.modality]
+    shell:
+        "python3 {input.script} -i {input.fastq} -o {params.out_folder} --single_cell --barcode {params.barcode} 2>&1"
+
+rule run_cellranger:
+    input:
+        # Path to cellranger files defined in this function
+        lambda wildcards: get_fastq_for_cellranger(fastq_folder=config['input_folder'] ,sample = wildcards.sample,modality = wildcards.modality , barcode = config['modalities'][wildcards.modality])
+    output:
+        bam   = 'results/{sample}/{modality}/cellranger/outs/possorted_bam.bam',
+        frag  = 'results/{sample}/{modality}/cellranger/outs/fragments.tsv.gz',
+        meta  = 'results/{sample}/{modality}/cellranger/outs/singlecell.csv',
+        peaks = 'results/{sample}/{modality}/cellranger/outs/peaks.bed',
+    params:
+        cellranger_ref    = config['cellranger_ref'],
+        fastq_folder      = lambda wildcards: '{wd}/results/{sample}/{modality}/fastq_demultiplexed/'.format(wd = os.getcwd(), sample = wildcards.sample, modality=wildcards.modality),
+        out_folder        = lambda wildcards: 'results/{sample}/cellranger/{modality}/'.format(sample = wildcards.sample, modality= wildcards.modality),
+        cellranger_parent = lambda wildcards: 'results/{sample}/cellranger/'.format(sample = wildcards.sample),
+    threads: 40
+    shell:
+        'rm -r {params.out_folder}; '
+        'cd {params.cellranger_parent}; '
+        '/data/bin/cellranger-atac count --id {wildcards.modality} --reference {params.cellranger_ref} --fastqs {params.fastq_folder}'
+
+rule run_macs_broad:
+    input:
+        cellranger_bam = 'results/{sample}/{modality}/cellranger/outs/possorted_bam.bam'
+    output:
+        broad_peaks = 'results/{sample}/{modality}/peaks/macs_broad/{sample}_peaks.broadPeak'
+    params:
+        macs_outdir = 'results/{sample}/peaks/macs_broad/'
+    shell:
+        'macs2 callpeak -t {input} -g mm -f BAMPE -n {wildcards.modality} '
+        '--outdir {params.macs_outdir} --llocal 100000 --keep-dup=1 --broad-cutoff=0.1 ' 
+        '--max-gap 1000 --broad 2>&1 '
+
+rule add_sample_id_to_fragments_file:
+    input:
+        fragments = 'results/{sample}/{modality}/cellranger/outs/fragments.tsv.gz',
+        script    = workflow_dir + '/scripts/add_sample_to_fragments.py',
+    output:
+        fragments = 'results/{sample}/{modality}/fragments/fragments.tsv.gz',
+        index     = 'results/{sample}/{modality}/fragments/fragments.tsv.gz.tbi',
+    shell:
+        'python3 {input.script} {input.fragments} {wildcards.sample} | bgzip > {output.fragments}; '
+        'tabix -p bed {output.fragments}'
+
+rule barcode_overlap_peaks:
+    input:
+        bam    = 'results/{sample}/{modality}/cellranger/outs/possorted_bam.bam',
+        peaks  = 'results/{sample}/{modality}/peaks/macs_broad/{sample}_peaks.broadPeak',
+        get_cell_barcode= workflow_dir + '/scripts/get_cell_barcode.awk',
+        add_sample_to_list= workflow_dir + '/scripts/add_sample_to_list.py',
+    output:
+        overlap = 'results/{sample}/{modality}/cell_picking/barcode_metrics/peaks_barcodes.txt'
+    params:
+        tmpdir               = config['tempdir']
+    shell:
+        'bedtools intersect -abam {input.bam} -b {input.peaks} -u | samtools view -f2 | '
+        'awk -f {input.get_cell_barcode} | sed "s/CB:Z://g" | python3 {input.add_sample_to_list} {wildcards.sample} | '
+        'sort -T {params.tmpdir} | uniq -c > {output.overlap} && [[ -s {output.overlap} ]] ; '
+
+rule barcode_metrics_all:
+  input:
+     bam       = 'results/{sample}/{modality}/cellranger/outs/possorted_bam.bam',
+     get_cell_barcode   = workflow_dir + '/scripts/get_cell_barcode.awk',
+     add_sample_to_list=workflow_dir + '/scripts/add_sample_to_list.py',
+  output:
+    all_bcd    = 'results/{sample}/{modality}/cell_picking/barcode_metrics/all_barcodes.txt'
+  params:
+      tmpdir             = config['tempdir']
+  shell:
+    ' samtools view -f2 {input.bam}| '
+    'awk -f {input.get_cell_barcode} | sed "s/CB:Z://g" | python3 {input.add_sample_to_list} {wildcards.sample} | '
+    'sort -T {params.tmpdir} | uniq -c > {output.all_bcd} && [[ -s {output.all_bcd} ]] ; '
+
+
+####### CELLS SELECTION
+rule cell_selection:
+    input:
+        bcd_all   = 'results/{sample}/{modality}/cell_picking/barcode_metrics/all_barcodes.txt',
+        bcd_peak  = 'results/{sample}/{modality}/cell_picking/barcode_metrics/peaks_barcodes.txt',
+        peaks     = 'results/{sample}/{modality}/peaks/macs_broad/{sample}_peaks.broadPeak',
+        metadata  = 'results/{sample}/{modality}/cellranger/outs/singlecell.csv',
+        fragments = 'results/{sample}/{modality}/cellranger/outs/fragments.tsv.gz',
+        script    = workflow_dir + '/scripts/pick_cells.R',
+    output:
+        'results/{sample}/{modality}/cell_picking/cells_10x.png',
+        'results/{sample}/{modality}/cell_picking/cells_picked.png',
+        'results/{sample}/{modality}/cell_picking/cells_picked.bw',
+        'results/{sample}/{modality}/cell_picking/cells_not_picked.bw',
+        'results/{sample}/{modality}/cell_picking/metadata.csv',
+    params:
+        out_prefix  = 'results/{sample}/{modality}/cell_picking/cell_picking/',
+    shell:
+        "Rscript {params.script} --metadata {input.metadata} --fragments {input.fragments} --bcd_all {input.bcd_all} --bcd_peak {input.bcd_peak} --antibody {wildcards.modality} --sample {wildcards.sample} --out_prefix {params.out_prefix}"
+
+rule create_seurat_object_bins:
+    input:
+        fragments = 'results/{sample}/{modality}/cellranger/outs/fragments.tsv.gz',
+        metadata  = 'results/{sample}/{modality}/cellranger/outs/singlecell.csv',
+        script    = workflow_dir + '/scripts/create_seurat_object.R',
+    output:
+        'results/{sample}/{modality}/seurat/bin_{binwidth}/Seurat_object.Rds',
+    params:
+        out_prefix  = 'results/{sample}/{modality}/seurat/bin_{binwidth}/',
+        genome      = config['genome'],
+    shell:
+        "Rscript {input.script} --sample {wildcards.sample}   --antibody {wildcards.modality} --metadata {input.metadata} --fragments {input.fragments} --out_prefix {params.out_prefix} --window {wildcards.binwidth} --genome_version {params.genome}"
+
+
+rule create_seurat_object_peaks:
+    input:
+        fragments = 'results/{sample}/{modality}/cellranger/outs/fragments.tsv.gz',
+        metadata  = 'results/{sample}/{modality}/cellranger/outs/singlecell.csv',
+        peaks     = 'results/{sample}/{modality}/peaks/macs_broad/{sample}_peaks.broadPeak',
+        script    = workflow_dir + '/scripts/create_seurat_object.R',
+    output:
+        'results/{sample}/{modality}/seurat/peaks/Seurat_object.Rds',
+    params:
+        out_prefix  = 'results/{sample}/{modality}/seurat/peaks/',
+        genome      = config['genome'],
+    shell:
+        "Rscript {input.script} --sample {wildcards.sample}   --antibody {wildcards.modality} --metadata {input.metadata} --fragments {input.fragments} " \ 
+        " --peaks {input.peaks} --out_prefix {params.out_prefix} --genome_version {params.genome}"
